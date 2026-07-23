@@ -8,7 +8,10 @@
 //!
 //! ```no_run
 //! use nagisa_rs::Tagger;
-//! let tagger = Tagger::new("models").unwrap();
+//! // Prefer the crate-embedded model (no external files needed):
+//! let tagger = Tagger::embedded().unwrap();
+//! // Or load from a directory of weights/dicts:
+//! // let tagger = Tagger::new("models").unwrap();
 //! let words = tagger.wakati("本日は晴天なり。");
 //! let tagged = tagger.tagging("本日は晴天なり。");
 //! ```
@@ -22,13 +25,14 @@ pub mod weights;
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
-pub use features::{feature_extraction, VocabConfig};
+pub use features::{VocabConfig, feature_extraction};
 pub use lstm::{encode, segment, viterbi};
 pub use preprocess::preprocess;
 pub use weights::{
-    load_hp, load_vocab, load_weights, load_word2postags, HyperParams, Vocab, Weights,
+    HyperParams, Vocab, Weights, load_hp, load_hp_from_str, load_vocab, load_vocab_from_str,
+    load_weights, load_weights_from_bytes, load_word2postags, load_word2postags_from_str,
 };
 
 /// 词性标注结果。
@@ -51,6 +55,37 @@ pub struct Tagger {
 }
 
 impl Tagger {
+    /// Load the model that ships with this crate (`models/` via `include_*!`).
+    ///
+    /// No external files or download are required. Preferred for app embedding.
+    pub fn embedded() -> Result<Self> {
+        // Compile-time bundle of the seven files required for inference.
+        // ~25 MB total; kept in the binary so consumers never need models/.
+        let hp = load_hp_from_str(include_str!("../models/hp.json")).context("embedded hp")?;
+        let weights = load_weights_from_bytes(include_bytes!("../models/weights.safetensors"))
+            .context("embedded weights")?;
+        let uni2id = load_vocab_from_str(include_str!("../models/uni2id.json"), "uni2id")
+            .context("embedded uni2id")?;
+        let bi2id = load_vocab_from_str(include_str!("../models/bi2id.json"), "bi2id")
+            .context("embedded bi2id")?;
+        let word2id = load_vocab_from_str(include_str!("../models/word2id.json"), "word2id")
+            .context("embedded word2id")?;
+        let pos2id_raw = load_vocab_from_str(include_str!("../models/pos2id.json"), "pos2id")
+            .context("embedded pos2id")?;
+        let word2postags =
+            load_word2postags_from_str(include_str!("../models/word2postags.json"), "word2postags")
+                .context("embedded word2postags")?;
+        Ok(Self::from_parts(
+            hp,
+            weights,
+            uni2id,
+            bi2id,
+            word2id,
+            pos2id_raw,
+            word2postags,
+        ))
+    }
+
     /// 从目录加载模型。期望目录包含：`hp.json`、`weights.safetensors`、
     /// `uni2id.json`、`bi2id.json`、`word2id.json`、`pos2id.json`、`word2postags.json`。
     pub fn new(model_dir: impl AsRef<Path>) -> Result<Self> {
@@ -60,6 +95,28 @@ impl Tagger {
         let uni2id = load_vocab(&dir.join("uni2id.json"), "uni2id")?;
         let bi2id = load_vocab(&dir.join("bi2id.json"), "bi2id")?;
         let word2id = load_vocab(&dir.join("word2id.json"), "word2id")?;
+        let pos2id_raw = load_vocab(&dir.join("pos2id.json"), "pos2id")?;
+        let word2postags = load_word2postags(&dir.join("word2postags.json"), "word2postags")?;
+        Ok(Self::from_parts(
+            hp,
+            weights,
+            uni2id,
+            bi2id,
+            word2id,
+            pos2id_raw,
+            word2postags,
+        ))
+    }
+
+    fn from_parts(
+        hp: HyperParams,
+        weights: Weights,
+        uni2id: Vocab,
+        bi2id: Vocab,
+        word2id: Vocab,
+        pos2id_raw: Vocab,
+        word2postags: HashMap<String, Vec<u32>>,
+    ) -> Self {
         let cfg = VocabConfig {
             uni2id,
             bi2id,
@@ -67,19 +124,13 @@ impl Tagger {
             window_size: hp.window_size,
         };
         let trans_flat = weights.trans.as_slice_memory_order().unwrap().to_vec();
-
-        // POS 相关
-        let pos2id_raw = load_vocab(&dir.join("pos2id.json"), "pos2id")?;
         // pos2id.json 的值是 pos 字符串到 id（已确认）。
-        let pos2id: HashMap<String, u32> = pos2id_raw
-            .iter()
-            .map(|(k, &v)| (k.clone(), v))
-            .collect();
+        let pos2id: HashMap<String, u32> =
+            pos2id_raw.iter().map(|(k, &v)| (k.clone(), v)).collect();
         let id2pos: HashMap<u32, String> = pos2id.iter().map(|(k, &v)| (v, k.clone())).collect();
-        let word2postags = load_word2postags(&dir.join("word2postags.json"), "word2postags")?;
         let use_noun_heuristic = pos2id.contains_key("名詞");
 
-        Ok(Self {
+        Self {
             hp,
             cfg,
             weights,
@@ -88,7 +139,7 @@ impl Tagger {
             id2pos,
             word2postags,
             use_noun_heuristic,
-        })
+        }
     }
 
     /// 词切分。等价于 `nagisa.wakati(text)`（不带 single_word_list）。
@@ -232,13 +283,35 @@ mod tests {
     }
 
     #[test]
+    fn embedded_matches_directory_load() {
+        let from_dir = Tagger::new(model_dir()).expect("load model from dir");
+        let from_embed = Tagger::embedded().expect("load embedded model");
+        let samples = [
+            "シンデレラライライゼロ",
+            "女子アナの仕事に耐える。辛抱大工です。",
+            "本日は島根県にある有名な人気ラーメン店にやってきました。",
+            "AIの進化が凄まじい。",
+        ];
+        for text in samples {
+            assert_eq!(
+                from_dir.wakati(text),
+                from_embed.wakati(text),
+                "wakati mismatch for {text:?}"
+            );
+            let a = from_dir.tagging(text);
+            let b = from_embed.tagging(text);
+            assert_eq!(a.words, b.words, "tagging words mismatch for {text:?}");
+            assert_eq!(
+                a.postags, b.postags,
+                "tagging postags mismatch for {text:?}"
+            );
+        }
+    }
+
+    #[test]
     fn ref1_short_kana() {
         let t = Tagger::new(model_dir()).expect("load model");
-        assert_wakati(
-            &t,
-            "シンデレライライゼロ",
-            &["シンデレ", "ライライゼロ"],
-        );
+        assert_wakati(&t, "シンデレライライゼロ", &["シンデレ", "ライライゼロ"]);
     }
 
     #[test]
@@ -257,7 +330,19 @@ mod tests {
         assert_wakati(
             &t,
             "女子アナの仕事に耐える。辛抱大工です。",
-            &["女子", "アナ", "の", "仕事", "に", "耐える", "。", "辛抱", "大工", "です", "。"],
+            &[
+                "女子",
+                "アナ",
+                "の",
+                "仕事",
+                "に",
+                "耐える",
+                "。",
+                "辛抱",
+                "大工",
+                "です",
+                "。",
+            ],
         );
     }
 
@@ -268,8 +353,24 @@ mod tests {
             &t,
             "本日は島根県にある有名な人気ラーメン店にやってきました。",
             &[
-                "本日", "は", "島根", "県", "に", "ある", "有名", "な", "人気", "ラーメン", "店", "に",
-                "やっ", "て", "き", "まし", "た", "。",
+                "本日",
+                "は",
+                "島根",
+                "県",
+                "に",
+                "ある",
+                "有名",
+                "な",
+                "人気",
+                "ラーメン",
+                "店",
+                "に",
+                "やっ",
+                "て",
+                "き",
+                "まし",
+                "た",
+                "。",
             ],
         );
     }
@@ -291,12 +392,44 @@ mod tests {
             &t,
             "本日は島根県にある有名な人気ラーメン店にやってきました。",
             &[
-                "本日", "は", "島根", "県", "に", "ある", "有名", "な", "人気", "ラーメン", "店", "に",
-                "やっ", "て", "き", "まし", "た", "。",
+                "本日",
+                "は",
+                "島根",
+                "県",
+                "に",
+                "ある",
+                "有名",
+                "な",
+                "人気",
+                "ラーメン",
+                "店",
+                "に",
+                "やっ",
+                "て",
+                "き",
+                "まし",
+                "た",
+                "。",
             ],
             &[
-                "名詞", "助詞", "名詞", "名詞", "助詞", "動詞", "形状詞", "助動詞", "名詞", "名詞",
-                "接尾辞", "助詞", "動詞", "助詞", "動詞", "助動詞", "助動詞", "補助記号",
+                "名詞",
+                "助詞",
+                "名詞",
+                "名詞",
+                "助詞",
+                "動詞",
+                "形状詞",
+                "助動詞",
+                "名詞",
+                "名詞",
+                "接尾辞",
+                "助詞",
+                "動詞",
+                "助詞",
+                "動詞",
+                "助動詞",
+                "助動詞",
+                "補助記号",
             ],
         );
     }

@@ -18,8 +18,11 @@ This crate reproduces Python `nagisa`'s output **byte-for-byte**. Every key comp
 use nagisa_rs::Tagger;
 
 fn main() {
-    // models/ ships with the repo (weights + dictionaries).
-    let tagger = Tagger::new("models").expect("failed to load model");
+    // Preferred: load the model compiled into the crate (~25 MB binary growth).
+    // No external files or download required.
+    let tagger = Tagger::embedded().expect("failed to load embedded model");
+    // Alternative: load from a directory of weights/dicts.
+    // let tagger = Tagger::new("models").expect("failed to load model");
 
     // Word segmentation
     let words = tagger.wakati("ネコは魚を食べるのが好きです。");
@@ -44,7 +47,8 @@ The crate is not published to crates.io yet. Use it from a git dependency:
 nagisa_rs = { git = "https://github.com/eclipse005/nagisa-rs.git" }
 ```
 
-The `models/` directory (weights + vocabularies) is bundled with the repo, so after cloning you can run inference immediately with no extra download.
+The model weights and dictionaries are **compiled into the crate** via `Tagger::embedded()`.
+The on-disk `models/` tree remains available for `Tagger::new` and for development tests.
 
 ## Build & test
 

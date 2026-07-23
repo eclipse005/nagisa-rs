@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use ndarray::{Array1, Array2};
 use safetensors::{Dtype, SafeTensors};
 use serde::Deserialize;
@@ -15,34 +15,34 @@ use serde::Deserialize;
 /// 名称沿用 Python 端 `weights.safetensors` 的导出键。
 pub struct Weights {
     // 查找表
-    pub uni_emb: Array2<f32>,    // (3090, 32)
-    pub bi_emb: Array2<f32>,     // (82114, 16)
-    pub ctype_emb: Array2<f32>,  // (7, 8)
-    pub word_emb: Array2<f32>,   // (59260, 16)
+    pub uni_emb: Array2<f32>,   // (3090, 32)
+    pub bi_emb: Array2<f32>,    // (82114, 16)
+    pub ctype_emb: Array2<f32>, // (7, 8)
+    pub word_emb: Array2<f32>,  // (59260, 16)
 
     // 双向 LSTM（WS）
     pub ws_fwd: LstmWeights,
     pub ws_bwd: LstmWeights,
 
     // 输出投影 + CRF 转移
-    pub w_ws: Array2<f32>,    // (6, 100)
-    pub b_ws: Array1<f32>,    // (6,)
-    pub trans: Array2<f32>,   // (6, 6)
+    pub w_ws: Array2<f32>,  // (6, 100)
+    pub b_ws: Array1<f32>,  // (6,)
+    pub trans: Array2<f32>, // (6, 6)
 
     // POS 标注所需权重
-    pub pos_emb: Array2<f32>,    // (24, 16)
-    pub char_fwd: LstmWeights,   // (4*16=64, 32) / (64,16) / (64,)
+    pub pos_emb: Array2<f32>,  // (24, 16)
+    pub char_fwd: LstmWeights, // (4*16=64, 32) / (64,16) / (64,)
     pub char_bwd: LstmWeights,
-    pub pos_fwd: LstmWeights,    // (4*50=200, 64) / (200,50) / (200,)
+    pub pos_fwd: LstmWeights, // (4*50=200, 64) / (200,50) / (200,)
     pub pos_bwd: LstmWeights,
-    pub w_pos: Array2<f32>,      // (24, 100)
-    pub b_pos: Array1<f32>,      // (24,)
+    pub w_pos: Array2<f32>, // (24, 100)
+    pub b_pos: Array1<f32>, // (24,)
 }
 
 pub struct LstmWeights {
-    pub w: Array2<f32>,  // (4H, in)  -> (200, 200) 或方向内 (200, 200)
-    pub u: Array2<f32>,  // (4H, H)   -> (200, 50)
-    pub b: Array1<f32>,  // (4H,)     -> (200,)
+    pub w: Array2<f32>, // (4H, in)  -> (200, 200) 或方向内 (200, 200)
+    pub u: Array2<f32>, // (4H, H)   -> (200, 50)
+    pub b: Array1<f32>, // (4H,)     -> (200,)
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,10 +72,8 @@ struct HpRaw {
     layers: usize,
 }
 
-pub fn load_hp(path: &Path) -> Result<HyperParams> {
-    let txt = std::fs::read_to_string(path)
-        .with_context(|| format!("read hp {}", path.display()))?;
-    let raw: HpRaw = serde_json::from_str(&txt).context("parse hp.json")?;
+pub fn load_hp_from_str(txt: &str) -> Result<HyperParams> {
+    let raw: HpRaw = serde_json::from_str(txt).context("parse hp.json")?;
     Ok(HyperParams {
         window_size: raw.window_size,
         dim_uni: raw.dim_uni,
@@ -88,35 +86,44 @@ pub fn load_hp(path: &Path) -> Result<HyperParams> {
     })
 }
 
+pub fn load_hp(path: &Path) -> Result<HyperParams> {
+    let txt =
+        std::fs::read_to_string(path).with_context(|| format!("read hp {}", path.display()))?;
+    load_hp_from_str(&txt)
+}
+
 /// 词汇表：String → id。
 pub type Vocab = HashMap<String, u32>;
 
-/// 加载形如 `{"<name>": { ... }}` 的嵌套 JSON 词汇表文件，取出内层 map。
-pub fn load_vocab(path: &Path, key: &str) -> Result<Vocab> {
-    let txt = std::fs::read_to_string(path)
-        .with_context(|| format!("read vocab {}", path.display()))?;
-    let val: serde_json::Value = serde_json::from_str(&txt).context("parse vocab json")?;
+/// 加载形如 `{"<name>": { ... }}` 的嵌套 JSON 词汇表，取出内层 map。
+pub fn load_vocab_from_str(txt: &str, key: &str) -> Result<Vocab> {
+    let val: serde_json::Value = serde_json::from_str(txt).context("parse vocab json")?;
     let inner = val
         .get(key)
-        .ok_or_else(|| anyhow!("vocab {} missing top-level key {}", path.display(), key))?
+        .ok_or_else(|| anyhow!("vocab missing top-level key {key}"))?
         .as_object()
-        .ok_or_else(|| anyhow!("vocab {} inner is not an object", path.display()))?;
+        .ok_or_else(|| anyhow!("vocab inner is not an object"))?;
     let mut out = HashMap::with_capacity(inner.len());
     for (k, v) in inner {
         let id = v
             .as_i64()
-            .ok_or_else(|| anyhow!("vocab {}: id for {:?} not integer", path.display(), k))?
-            as u32;
+            .ok_or_else(|| anyhow!("vocab: id for {k:?} not integer"))? as u32;
         out.insert(k.clone(), id);
     }
     Ok(out)
 }
 
+/// 加载形如 `{"<name>": { ... }}` 的嵌套 JSON 词汇表文件，取出内层 map。
+pub fn load_vocab(path: &Path, key: &str) -> Result<Vocab> {
+    let txt =
+        std::fs::read_to_string(path).with_context(|| format!("read vocab {}", path.display()))?;
+    load_vocab_from_str(&txt, key)
+        .with_context(|| format!("parse vocab {}", path.display()))
+}
+
 /// 加载 `{"<key>": {word: [pos_ids...]}}` 形式的 word→postags 映射。
-pub fn load_word2postags(path: &Path, key: &str) -> Result<HashMap<String, Vec<u32>>> {
-    let txt = std::fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
-    let val: serde_json::Value = serde_json::from_str(&txt).context("parse json")?;
+pub fn load_word2postags_from_str(txt: &str, key: &str) -> Result<HashMap<String, Vec<u32>>> {
+    let val: serde_json::Value = serde_json::from_str(txt).context("parse word2postags json")?;
     let inner = val
         .get(key)
         .ok_or_else(|| anyhow!("missing key {key}"))?
@@ -140,6 +147,13 @@ pub fn load_word2postags(path: &Path, key: &str) -> Result<HashMap<String, Vec<u
     Ok(out)
 }
 
+/// 加载 `{"<key>": {word: [pos_ids...]}}` 形式的 word→postags 映射。
+pub fn load_word2postags(path: &Path, key: &str) -> Result<HashMap<String, Vec<u32>>> {
+    let txt = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    load_word2postags_from_str(&txt, key)
+        .with_context(|| format!("parse {}", path.display()))
+}
+
 fn view_f32<'a>(st: &'a SafeTensors<'a>, name: &str) -> Result<(&'a [u8], Vec<usize>)> {
     let t = st
         .tensor(name)
@@ -157,7 +171,9 @@ fn to_array1(st: &SafeTensors<'_>, name: &str) -> Result<Array1<f32>> {
     }
     let n = shape[0];
     let mut out = Vec::with_capacity(n);
-    let bytes = data.get(0..n * 4).ok_or_else(|| anyhow!("{name}: short data"))?;
+    let bytes = data
+        .get(0..n * 4)
+        .ok_or_else(|| anyhow!("{name}: short data"))?;
     for chunk in bytes.chunks_exact(4) {
         out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
     }
@@ -172,7 +188,9 @@ fn to_array2(st: &SafeTensors<'_>, name: &str) -> Result<Array2<f32>> {
     let (rows, cols) = (shape[0], shape[1]);
     let mut out = Vec::with_capacity(rows * cols);
     let want = rows * cols * 4;
-    let bytes = data.get(0..want).ok_or_else(|| anyhow!("{name}: short data"))?;
+    let bytes = data
+        .get(0..want)
+        .ok_or_else(|| anyhow!("{name}: short data"))?;
     for chunk in bytes.chunks_exact(4) {
         out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
     }
@@ -187,10 +205,8 @@ fn lstm(st: &SafeTensors<'_>, prefix: &str) -> Result<LstmWeights> {
     })
 }
 
-pub fn load_weights(path: &Path) -> Result<Weights> {
-    let raw = std::fs::read(path)
-        .with_context(|| format!("read weights {}", path.display()))?;
-    let st = SafeTensors::deserialize(&raw).context("deserialize safetensors")?;
+pub fn load_weights_from_bytes(raw: &[u8]) -> Result<Weights> {
+    let st = SafeTensors::deserialize(raw).context("deserialize safetensors")?;
     Ok(Weights {
         uni_emb: to_array2(&st, "uni_emb")?,
         bi_emb: to_array2(&st, "bi_emb")?,
@@ -209,4 +225,9 @@ pub fn load_weights(path: &Path) -> Result<Weights> {
         w_pos: to_array2(&st, "w_pos")?,
         b_pos: to_array1(&st, "b_pos")?,
     })
+}
+
+pub fn load_weights(path: &Path) -> Result<Weights> {
+    let raw = std::fs::read(path).with_context(|| format!("read weights {}", path.display()))?;
+    load_weights_from_bytes(&raw)
 }
